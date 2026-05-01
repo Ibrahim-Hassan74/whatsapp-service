@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const express = require('express');
+const puppeteer = require('puppeteer');
 
 const app = express();
 app.use(express.json());
@@ -37,6 +38,7 @@ function createClient() {
         authStrategy: new LocalAuth({ dataPath: './sessions' }),
         puppeteer: {
             headless: true,
+            executablePath: puppeteer.executablePath(),
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
