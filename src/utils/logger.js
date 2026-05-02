@@ -28,6 +28,7 @@ const logger = winston.createLogger({
     format: isProduction ? productionFormat : developmentFormat,
     defaultMeta: {
         service: 'whatsapp-service',
+        pid: process.pid,
     },
     transports: [
         new winston.transports.Console(),

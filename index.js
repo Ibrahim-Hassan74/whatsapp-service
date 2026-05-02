@@ -3,6 +3,11 @@
  *
  * Production-ready WhatsApp Web gateway integrated with ASP.NET backend.
  * Uses whatsapp-web.js + Puppeteer with system Chromium.
+ *
+ * IMPORTANT: The HTTP server starts FIRST so that Render's health check
+ * receives a response immediately. WhatsApp client initialization happens
+ * AFTER the server is listening — this prevents Render from killing the
+ * process during the (potentially long) QR-scan wait.
  */
 
 const config = require('./src/config');
@@ -23,7 +28,12 @@ app.use(authMiddleware);
 app.use(routes);
 
 // ─── Graceful Shutdown ────────────────────────────────────────────
+let isShuttingDown = false;
+
 async function gracefulShutdown(signal) {
+    if (isShuttingDown) return; // Prevent double-shutdown
+    isShuttingDown = true;
+
     logger.info(`Received ${signal} — starting graceful shutdown`);
 
     await whatsapp.shutdown();
@@ -49,28 +59,41 @@ process.on('unhandledRejection', (reason) => {
         error: reason?.message || String(reason),
         stack: reason?.stack,
     });
+    // Do NOT exit — unhandled rejections are recoverable.
+    // The heartbeat will detect any WhatsApp disconnection.
 });
 
 process.on('uncaughtException', (err) => {
-    logger.error('Uncaught exception', {
+    logger.error('FATAL: Uncaught exception — process will exit', {
         error: err.message,
         stack: err.stack,
     });
-    // Don't exit — let the heartbeat detect and restart the client
+    // Per Node.js docs, continuing after uncaughtException is unsafe.
+    // Give the logger time to flush, then exit.
+    // Render (or Docker) will restart the process automatically.
+    setTimeout(() => process.exit(1), 3000);
 });
 
 // ─── Start ────────────────────────────────────────────────────────
 logger.info('Starting WhatsApp service', {
+    pid: process.pid,
     env: config.nodeEnv,
     port: config.port,
     chromium: config.chromiumPath,
     sessionPath: config.sessionDataPath,
+    nodeVersion: process.version,
+    memoryLimitMB: process.env.NODE_OPTIONS || 'default',
+    startedAt: new Date().toISOString(),
 });
 
-// Initialize WhatsApp client
-whatsapp.initializeClient({ forceNew: true });
-
-// Start HTTP server
+// Start HTTP server FIRST — this ensures Render's health check
+// gets a response immediately, preventing premature process kills.
 const server = app.listen(config.port, () => {
     logger.info(`Server listening on port ${config.port}`);
+
+    // THEN initialize the WhatsApp client.
+    // forceNew: false → reuses existing LocalAuth session from disk.
+    // This means no QR re-scan is needed after restarts/deploys.
+    logger.info('Starting WhatsApp client initialization (session reuse enabled)...');
+    whatsapp.initializeClient({ forceNew: false });
 });

@@ -20,6 +20,14 @@ let state = State.DISCONNECTED;
 let retryCount = 0;
 let restartTimer = null;
 let heartbeatTimer = null;
+let initLock = false;              // Hard lock against concurrent init
+let consecutiveHeartbeatFails = 0; // Track consecutive heartbeat failures
+let lastReadyTimestamp = 0;        // Debounce restarts after connect
+
+const HEARTBEAT_FAIL_THRESHOLD = 3;      // Failures before restart
+const READY_GRACE_PERIOD_MS = 30000;      // 30s grace after becoming READY
+const INIT_TIMEOUT_MS = 5 * 60 * 1000;   // 5 minutes max for initialize()
+const HEARTBEAT_STABILIZE_DELAY_MS = 15000; // Wait 15s after READY before heartbeat
 
 // ─── ASP.NET Backend Communication ────────────────────────────────
 async function postToAspNet(endpoint, data) {
@@ -52,22 +60,49 @@ async function postToAspNet(endpoint, data) {
 // ─── Heartbeat ────────────────────────────────────────────────────
 function startHeartbeat() {
     stopHeartbeat();
+    consecutiveHeartbeatFails = 0;
+
     heartbeatTimer = setInterval(async () => {
         if (state !== State.CONNECTED || !client) return;
 
         try {
             const wState = await client.getState();
-            if (wState !== 'CONNECTED') {
-                logger.warn('Heartbeat detected disconnected state', { wState });
+            if (wState === 'CONNECTED') {
+                // Healthy — reset failure counter
+                consecutiveHeartbeatFails = 0;
+                return;
+            }
+
+            // Not CONNECTED but not necessarily fatal (e.g. OPENING, PAIRING)
+            consecutiveHeartbeatFails++;
+            logger.warn('Heartbeat: unexpected WhatsApp state', {
+                wState,
+                consecutiveFails: consecutiveHeartbeatFails,
+                threshold: HEARTBEAT_FAIL_THRESHOLD,
+            });
+
+            if (consecutiveHeartbeatFails >= HEARTBEAT_FAIL_THRESHOLD) {
+                logger.error('Heartbeat: too many consecutive failures — triggering reconnect');
                 state = State.DISCONNECTED;
+                consecutiveHeartbeatFails = 0;
                 postToAspNet('/update-status', { isConnected: false });
                 scheduleRestart('heartbeat-disconnect');
             }
         } catch (err) {
-            logger.warn('Heartbeat check failed', { error: err.message });
-            state = State.DISCONNECTED;
-            postToAspNet('/update-status', { isConnected: false });
-            scheduleRestart('heartbeat-error');
+            consecutiveHeartbeatFails++;
+            logger.warn('Heartbeat check failed', {
+                error: err.message,
+                consecutiveFails: consecutiveHeartbeatFails,
+                threshold: HEARTBEAT_FAIL_THRESHOLD,
+            });
+
+            if (consecutiveHeartbeatFails >= HEARTBEAT_FAIL_THRESHOLD) {
+                logger.error('Heartbeat: too many consecutive errors — triggering reconnect');
+                state = State.DISCONNECTED;
+                consecutiveHeartbeatFails = 0;
+                postToAspNet('/update-status', { isConnected: false });
+                scheduleRestart('heartbeat-error');
+            }
         }
     }, config.heartbeatIntervalMs);
 }
@@ -77,6 +112,7 @@ function stopHeartbeat() {
         clearInterval(heartbeatTimer);
         heartbeatTimer = null;
     }
+    consecutiveHeartbeatFails = 0;
 }
 
 // ─── Client Factory ───────────────────────────────────────────────
@@ -98,6 +134,11 @@ function createClient() {
         '--disable-background-networking',
         '--disable-default-apps',
         '--disable-sync',
+        // Memory-saving flags for constrained environments (Render, Docker)
+        '--disable-background-timer-throttling',
+        '--disable-renderer-backgrounding',
+        '--disable-backgrounding-occluded-windows',
+        '--js-flags=--max-old-space-size=256',
     ];
 
     // These flags reduce memory but only work reliably on Linux (Docker)
@@ -126,25 +167,39 @@ function createClient() {
     newClient.on('ready', () => {
         state = State.CONNECTED;
         retryCount = 0;
-        logger.info('WhatsApp client is READY and connected');
+        lastReadyTimestamp = Date.now();
+        consecutiveHeartbeatFails = 0;
+        logger.info('WhatsApp client is READY and connected', {
+            pid: process.pid,
+            uptime: Math.floor(process.uptime()),
+        });
         postToAspNet('/update-status', { isConnected: true });
-        startHeartbeat();
+
+        // Delay heartbeat start to let the connection stabilize
+        // This prevents false positives immediately after connect
+        logger.info(`Heartbeat will start in ${HEARTBEAT_STABILIZE_DELAY_MS / 1000}s`);
+        setTimeout(() => {
+            if (state === State.CONNECTED) {
+                startHeartbeat();
+                logger.info('Heartbeat started');
+            }
+        }, HEARTBEAT_STABILIZE_DELAY_MS);
     });
 
     // ── Authenticated ──
     newClient.on('authenticated', () => {
-        logger.info('WhatsApp client authenticated successfully');
+        logger.info('WhatsApp client authenticated successfully (session loaded from disk)');
     });
 
     // ── Auth Failure ──
     newClient.on('auth_failure', (msg) => {
         state = State.DISCONNECTED;
         stopHeartbeat();
-        logger.error('Authentication failure', { message: msg });
+        logger.error('Authentication failure — will retry with fresh session', { message: msg });
         postToAspNet('/update-status', { isConnected: false });
 
-        // Auth failures often need a fresh session
-        scheduleRestart('auth-failure');
+        // Auth failures need a fresh session
+        scheduleRestart('auth-failure', { forceNew: true });
     });
 
     // ── Disconnected ──
@@ -153,6 +208,7 @@ function createClient() {
         stopHeartbeat();
         logger.warn('WhatsApp client disconnected', { reason });
         postToAspNet('/update-status', { isConnected: false });
+        // Try to reconnect reusing the existing session first
         scheduleRestart('disconnect');
     });
 
@@ -190,11 +246,20 @@ async function destroyClient() {
 
 // ─── Initialize ───────────────────────────────────────────────────
 async function initializeClient({ forceNew = false } = {}) {
+    // Hard lock — absolutely prevent concurrent initialization
+    if (initLock) {
+        logger.warn('initializeClient() called but init lock is held — skipping', {
+            currentState: state,
+        });
+        return;
+    }
+
     if (state === State.INITIALIZING || state === State.RECONNECTING) {
         logger.warn('Client initialization already in progress — skipping');
         return;
     }
 
+    initLock = true;
     state = forceNew ? State.INITIALIZING : State.RECONNECTING;
     clearTimeout(restartTimer);
     restartTimer = null;
@@ -205,8 +270,22 @@ async function initializeClient({ forceNew = false } = {}) {
             client = createClient();
         }
 
-        logger.info('Initializing WhatsApp client...', { attempt: retryCount + 1 });
-        await client.initialize();
+        logger.info('Initializing WhatsApp client...', {
+            attempt: retryCount + 1,
+            forceNew,
+            hasExistingClient: !!client,
+        });
+
+        // Wrap initialize() in a timeout to prevent hanging forever
+        await Promise.race([
+            client.initialize(),
+            new Promise((_, reject) =>
+                setTimeout(
+                    () => reject(new Error(`Client initialization timed out after ${INIT_TIMEOUT_MS / 1000}s`)),
+                    INIT_TIMEOUT_MS
+                )
+            ),
+        ]);
     } catch (err) {
         state = State.DISCONNECTED;
         logger.error('Client initialization failed', {
@@ -221,12 +300,31 @@ async function initializeClient({ forceNew = false } = {}) {
             logger.error('Max retries reached — giving up. Manual restart required.');
             postToAspNet('/update-status', { isConnected: false });
         }
+    } finally {
+        initLock = false;
     }
 }
 
 // ─── Schedule Restart (Exponential Backoff) ───────────────────────
-function scheduleRestart(reason) {
+function scheduleRestart(reason, { forceNew = false } = {}) {
     if (restartTimer || state === State.INITIALIZING || state === State.RECONNECTING) {
+        logger.info('scheduleRestart() skipped — already pending or initializing', {
+            reason,
+            hasTimer: !!restartTimer,
+            state,
+        });
+        return;
+    }
+
+    // Debounce: if we just became READY, don't restart for a grace period.
+    // This prevents false restarts from transient post-connect instability.
+    const timeSinceReady = Date.now() - lastReadyTimestamp;
+    if (lastReadyTimestamp > 0 && timeSinceReady < READY_GRACE_PERIOD_MS) {
+        logger.info('scheduleRestart() skipped — within grace period after READY', {
+            reason,
+            timeSinceReadyMs: timeSinceReady,
+            gracePeriodMs: READY_GRACE_PERIOD_MS,
+        });
         return;
     }
 
@@ -236,13 +334,14 @@ function scheduleRestart(reason) {
 
     logger.info('Scheduling restart', {
         reason,
+        forceNew,
         attempt: retryCount,
         delaySeconds: delay / 1000,
     });
 
     restartTimer = setTimeout(() => {
         restartTimer = null;
-        initializeClient({ forceNew: true });
+        initializeClient({ forceNew });
     }, delay);
 }
 

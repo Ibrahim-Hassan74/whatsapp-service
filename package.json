@@ -4,7 +4,7 @@
   "description": "Production-ready WhatsApp Web service with Puppeteer, integrated with ASP.NET backend",
   "main": "index.js",
   "scripts": {
-    "start": "NODE_ENV=production node index.js",
+    "start": "NODE_ENV=production node --max-old-space-size=384 index.js",
     "dev": "node index.js",
     "docker:build": "docker compose build",
     "docker:up": "docker compose up -d",
