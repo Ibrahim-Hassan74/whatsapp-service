@@ -251,13 +251,19 @@ function sleep(ms) {
 /**
  * Mark the client as a "zombie" — it thinks it's connected but the browser
  * is actually broken (detached frame, auth timeout, etc).
- * Triggers a soft reconnect (reuses session, does NOT force new QR).
+ * Destroys the broken client and schedules a soft reconnect.
+ * LocalAuth session data persists on disk → no new QR scan needed.
  */
-function markAsZombie(reason) {
+async function markAsZombie(reason) {
     if (isShuttingDown || state !== State.CONNECTED) return;
-    logger.warn('Client marked as zombie — scheduling soft reconnect', { reason });
+    logger.warn('Client marked as zombie — destroying broken client', { reason });
     state = State.DISCONNECTED;
     postToAspNet('/update-status', { isConnected: false });
+
+    // Destroy the broken client so initializeClient creates a fresh one.
+    // LocalAuth session data stays on disk → session will be restored.
+    await destroyClient();
+
     scheduleRestart(`zombie-${reason}`);
 }
 
