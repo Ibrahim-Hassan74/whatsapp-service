@@ -33,21 +33,32 @@ function findChromeInPuppeteerCache(cacheDir) {
 
 // ─── Chromium Path Auto-Detection ─────────────────────────────────
 function detectChromiumPath() {
+    const debug = (msg) => console.log(`[chromium-detect] ${msg}`);
+
     // 1. Explicit env var takes priority
     if (process.env.CHROMIUM_PATH) {
+        debug(`Using CHROMIUM_PATH env var: ${process.env.CHROMIUM_PATH}`);
         return process.env.CHROMIUM_PATH;
     }
 
-    // 2. Puppeteer cache (Render, Railway, or any platform using render-build.sh)
+    // 2. Puppeteer cache directories (project-local first, then system)
+    const projectRoot = path.resolve(__dirname, '..', '..');
     const puppeteerCacheDirs = [
-        process.env.PUPPETEER_CACHE_DIR,
-        '/opt/render/.cache/puppeteer',
-        path.join(process.env.HOME || '', '.cache', 'puppeteer'),
+        path.join(projectRoot, '.cache', 'puppeteer'),           // Project-local (render-build.sh)
+        process.env.PUPPETEER_CACHE_DIR,                          // Explicit env var
+        '/opt/render/.cache/puppeteer',                           // Render system cache
+        '/opt/render/project/src/.cache/puppeteer',               // Render project path
+        path.join(process.env.HOME || '', '.cache', 'puppeteer'), // User home cache
     ];
 
     for (const cacheDir of puppeteerCacheDirs) {
+        if (!cacheDir) continue;
+        debug(`Scanning cache: ${cacheDir} (exists: ${fs.existsSync(cacheDir)})`);
         const found = findChromeInPuppeteerCache(cacheDir);
-        if (found) return found;
+        if (found) {
+            debug(`Found Chrome in cache: ${found}`);
+            return found;
+        }
     }
 
     // 3. Docker / Linux — system Chromium
@@ -75,10 +86,15 @@ function detectChromiumPath() {
 
     for (const candidate of candidates) {
         if (candidate && fs.existsSync(candidate)) {
+            debug(`Found system Chrome: ${candidate}`);
             return candidate;
         }
     }
 
+    debug('No Chrome/Chromium binary found anywhere!');
+    debug(`Project root: ${projectRoot}`);
+    debug(`HOME: ${process.env.HOME}`);
+    debug(`CWD: ${process.cwd()}`);
     return null;
 }
 
