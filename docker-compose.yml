@@ -1,0 +1,25 @@
+services:
+  whatsapp:
+    build: .
+    container_name: whatsapp-service
+    ports:
+      - "${PORT:-5000}:5000"
+    env_file: .env
+    volumes:
+      # Persist WhatsApp session data across container restarts
+      - whatsapp_sessions:/app/sessions
+    restart: unless-stopped
+    # Chromium needs more than the default 64MB shared memory
+    shm_size: "1gb"
+    environment:
+      - NODE_ENV=production
+      - SESSION_DATA_PATH=/app/sessions
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whatsapp_sessions:
+    driver: local

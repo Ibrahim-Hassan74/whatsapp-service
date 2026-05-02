@@ -1,20 +1,27 @@
 {
-  "name": "whatsapp",
-  "version": "1.0.0",
+  "name": "whatsapp-service",
+  "version": "2.0.0",
+  "description": "Production-ready WhatsApp Web service with Puppeteer, integrated with ASP.NET backend",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node index.js"
+    "start": "NODE_ENV=production node index.js",
+    "dev": "node index.js",
+    "docker:build": "docker compose build",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f whatsapp"
   },
-  "keywords": [],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["whatsapp", "puppeteer", "whatsapp-web.js"],
   "author": "",
   "license": "ISC",
-  "description": "",
   "dependencies": {
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "puppeteer": "^24.42.0",
-    "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.34.6"
+    "puppeteer-core": "^24.42.0",
+    "whatsapp-web.js": "^1.34.6",
+    "winston": "^3.17.0"
   }
 }

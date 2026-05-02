@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: whatsapp-service
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    disk:
+      name: whatsapp-sessions
+      mountPath: /app/sessions
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SESSION_DATA_PATH
+        value: /app/sessions
+      - key: PORT
+        value: "5000"
+      - key: ASP_NET_BASE_URL
+        sync: false
+      - key: NODE_TOKEN
+        sync: false
+      - key: SERVER_NAME
+        value: NODE_WHATSAPP_SERVICE

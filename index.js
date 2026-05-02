@@ -1,204 +1,76 @@
-require('dotenv').config();
+/**
+ * WhatsApp Service — Entry Point
+ *
+ * Production-ready WhatsApp Web gateway integrated with ASP.NET backend.
+ * Uses whatsapp-web.js + Puppeteer with system Chromium.
+ */
 
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const config = require('./src/config');
+const logger = require('./src/utils/logger');
 const express = require('express');
+const authMiddleware = require('./src/middleware/auth');
+const routes = require('./src/routes');
+const whatsapp = require('./src/services/whatsappClient');
 
+// ─── Express Setup ────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 
-const ASP_NET_BASE_URL = process.env.ASP_NET_BASE_URL;
-const NODE_TOKEN = process.env.NODE_TOKEN;
-const SERVER_NAME = process.env.SERVER_NAME;
-const PORT = process.env.PORT || 5000;
+// Authentication middleware (skips /health automatically)
+app.use(authMiddleware);
 
-let client = null;
-let isClientReady = false;
-let isInitializing = false;
-let restartTimer = null;
+// Routes
+app.use(routes);
 
-async function postToAspNet(endpoint, data) {
-    try {
-        await fetch(`${ASP_NET_BASE_URL}/api/WhatsApp${endpoint}`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-node-token': NODE_TOKEN,
-                'x-server-name': SERVER_NAME
-            },
-            body: JSON.stringify(data)
-        });
-    } catch (e) {
-        console.error(`Failed to reach ASP.NET: ${endpoint}`, e.message);
-    }
-}
+// ─── Graceful Shutdown ────────────────────────────────────────────
+async function gracefulShutdown(signal) {
+    logger.info(`Received ${signal} — starting graceful shutdown`);
 
-function createClient() {
-    const nextClient = new Client({
-        authStrategy: new LocalAuth({ dataPath: './sessions' }),
-        puppeteer: {
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu'
-            ]
-        }
+    await whatsapp.shutdown();
+
+    server.close(() => {
+        logger.info('HTTP server closed');
+        process.exit(0);
     });
 
-    nextClient.on('qr', (qr) => {
-        console.log('QR Generated');
-        postToAspNet('/update-qr', { qrCode: qr });
-    });
-
-    nextClient.on('ready', () => {
-        isClientReady = true;
-        console.log('WhatsApp READY');
-        postToAspNet('/update-status', { isConnected: true });
-    });
-
-    nextClient.on('auth_failure', (msg) => {
-        isClientReady = false;
-        console.error('Auth failure:', msg);
-        postToAspNet('/update-status', { isConnected: false });
-    });
-
-    nextClient.on('disconnected', (reason) => {
-        isClientReady = false;
-        console.log('Disconnected:', reason);
-        postToAspNet('/update-status', { isConnected: false });
-        scheduleRestart('disconnect');
-    });
-
-    return nextClient;
+    // Force exit after 10s if graceful shutdown hangs
+    setTimeout(() => {
+        logger.error('Forced exit after timeout');
+        process.exit(1);
+    }, 10000);
 }
 
-async function destroyClient() {
-    if (!client) return;
-    try {
-        await client.destroy();
-    } catch (err) {
-        console.warn('Destroy error ignored:', err.message);
-    }
-}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-async function initializeClient({ forceNew = false, retry = 0 } = {}) {
-    if (isInitializing) return;
-
-    isInitializing = true;
-    clearTimeout(restartTimer);
-
-    try {
-        if (forceNew || !client) {
-            await destroyClient();
-            client = createClient();
-        }
-
-        console.log('Initializing WhatsApp...');
-        await client.initialize();
-    } catch (err) {
-        isClientReady = false;
-        console.error('Init failed:', err.message);
-
-        if (retry < 3) {
-            const delay = 3000 * (retry + 1);
-            console.log(`Retry in ${delay / 1000}s`);
-
-            restartTimer = setTimeout(() => {
-                initializeClient({ forceNew: true, retry: retry + 1 });
-            }, delay);
-        } else {
-            postToAspNet('/update-status', { isConnected: false });
-        }
-    } finally {
-        isInitializing = false;
-    }
-}
-
-function scheduleRestart(reason) {
-    if (restartTimer || isInitializing) return;
-
-    console.log(`Restart scheduled due to ${reason}`);
-    restartTimer = setTimeout(() => {
-        initializeClient({ forceNew: true });
-    }, 5000);
-}
-
-app.use((req, res, next) => {
-    if (req.path === '/health') return next();
-
-    const token = req.headers['x-node-token'];
-    const server = req.headers['x-server-name'];
-
-    if (token !== NODE_TOKEN || server !== SERVER_NAME) {
-        return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    next();
-});
-
-app.post('/send', async (req, res) => {
-    const { number, message } = req.body;
-
-    if (!number || !message)
-        return res.status(400).json({ error: 'Invalid payload' });
-
-    if (!isClientReady || !client)
-        return res.status(503).json({ error: 'Client not ready' });
-
-    try {
-        await client.sendMessage(`${number}@c.us`, message);
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-app.get('/status', async (req, res) => {
-    try {
-        if (!client) {
-            return res.json({ connected: false, state: 'INIT' });
-        }
-
-        const state = await client.getState();
-
-        res.json({
-            connected: state === 'CONNECTED',
-            state
-        });
-    } catch {
-        res.json({ connected: false });
-    }
-});
-
-app.post('/logout', async (req, res) => {
-    try {
-        isClientReady = false;
-
-        if (client) {
-            await client.logout();
-        }
-
-        await initializeClient({ forceNew: true });
-
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok' });
-});
-
+// ─── Global Error Handlers ────────────────────────────────────────
 process.on('unhandledRejection', (reason) => {
-    console.error('Unhandled:', reason?.message || reason);
-    isClientReady = false;
-    scheduleRestart('error');
+    logger.error('Unhandled promise rejection', {
+        error: reason?.message || String(reason),
+        stack: reason?.stack,
+    });
 });
 
-initializeClient({ forceNew: true });
+process.on('uncaughtException', (err) => {
+    logger.error('Uncaught exception', {
+        error: err.message,
+        stack: err.stack,
+    });
+    // Don't exit — let the heartbeat detect and restart the client
+});
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+// ─── Start ────────────────────────────────────────────────────────
+logger.info('Starting WhatsApp service', {
+    env: config.nodeEnv,
+    port: config.port,
+    chromium: config.chromiumPath,
+    sessionPath: config.sessionDataPath,
+});
+
+// Initialize WhatsApp client
+whatsapp.initializeClient({ forceNew: true });
+
+// Start HTTP server
+const server = app.listen(config.port, () => {
+    logger.info(`Server listening on port ${config.port}`);
 });
