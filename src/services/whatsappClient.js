@@ -48,7 +48,7 @@ const INIT_TIMEOUT_MS = 5 * 60 * 1000;    // 5 minutes max for initialize()
 const MIN_RESTART_DELAY_MS = 15000;        // Minimum 15s between restarts
 const MAX_RESTART_DELAY_MS = 120000;       // Max 2 minutes between restarts
 
-// Transient Puppeteer errors that should NOT trigger a restart
+// Transient Puppeteer errors that should NOT crash the process
 const TRANSIENT_ERRORS = [
     'Target closed',
     'Session closed',
@@ -58,6 +58,9 @@ const TRANSIENT_ERRORS = [
     'Cannot find context',
     'frame was detached',
     'Page crashed',
+    'auth timeout',
+    'detached Frame',
+    'Attempted to use detached Frame',
 ];
 
 function isTransientError(errorMessage) {
@@ -224,11 +227,13 @@ function createClient() {
     });
 
     // ── Change State ──
-    // Informational only — do NOT trigger restarts from state changes
     newClient.on('change_state', (newState) => {
         logger.info('WhatsApp state changed', { newState });
-        // Do NOT restart on state changes. States like OPENING, PAIRING,
-        // TIMEOUT are transient and resolve on their own.
+        // TIMEOUT means WhatsApp lost connection — trigger soft reconnect
+        if (newState === 'TIMEOUT' && state === State.CONNECTED && !isShuttingDown) {
+            logger.warn('WhatsApp state TIMEOUT detected — will soft reconnect');
+            markAsZombie('change_state_timeout');
+        }
     });
 
     return newClient;
@@ -237,6 +242,19 @@ function createClient() {
 // ─── Helpers ──────────────────────────────────────────────────────
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Mark the client as a "zombie" — it thinks it's connected but the browser
+ * is actually broken (detached frame, auth timeout, etc).
+ * Triggers a soft reconnect (reuses session, does NOT force new QR).
+ */
+function markAsZombie(reason) {
+    if (isShuttingDown || state !== State.CONNECTED) return;
+    logger.warn('Client marked as zombie — scheduling soft reconnect', { reason });
+    state = State.DISCONNECTED;
+    postToAspNet('/update-status', { isConnected: false });
+    scheduleRestart(`zombie-${reason}`);
 }
 
 // ─── Destroy Client ───────────────────────────────────────────────
@@ -456,4 +474,5 @@ module.exports = {
     isReady,
     resetRetries,
     postToAspNet,
+    markAsZombie,
 };

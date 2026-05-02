@@ -59,13 +59,24 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // ─── Global Error Handlers ────────────────────────────────────────
+const SUPPRESSED_ERRORS = [
+    'Target closed', 'Protocol error', 'Session closed',
+    'detached Frame', 'Execution context', 'frame was detached',
+];
+
 process.on('unhandledRejection', (reason) => {
     const msg = reason?.message || String(reason);
 
-    // Ignore Puppeteer "Target closed" errors — these are expected
-    // during page navigation and shutdown
-    if (msg.includes('Target closed') || msg.includes('Protocol error')) {
-        logger.warn('Suppressed transient Puppeteer rejection', { error: msg });
+    // Suppress known transient Puppeteer/browser errors
+    if (SUPPRESSED_ERRORS.some((e) => msg.includes(e))) {
+        logger.warn('Suppressed transient rejection', { error: msg });
+        return;
+    }
+
+    // "auth timeout" means WhatsApp session expired in-flight — soft reconnect
+    if (msg.includes('auth timeout')) {
+        logger.warn('Auth timeout detected — marking client as zombie', { error: msg });
+        whatsapp.markAsZombie('auth-timeout');
         return;
     }
 
@@ -76,9 +87,11 @@ process.on('unhandledRejection', (reason) => {
 });
 
 process.on('uncaughtException', (err) => {
-    // Puppeteer transient errors should NOT crash the process
-    if (err.message.includes('Target closed') || err.message.includes('Protocol error')) {
-        logger.warn('Suppressed transient Puppeteer exception', { error: err.message });
+    const msg = err.message || '';
+
+    // Suppress transient Puppeteer errors — do NOT crash
+    if (SUPPRESSED_ERRORS.some((e) => msg.includes(e)) || msg.includes('auth timeout')) {
+        logger.warn('Suppressed transient exception', { error: msg });
         return;
     }
 

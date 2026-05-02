@@ -55,6 +55,19 @@ router.post('/send', async (req, res) => {
             error: err.message,
             number: number.slice(-4),
         });
+
+        // If the error is a browser/frame issue, the client is a zombie.
+        // Mark it so it soft-reconnects (reuses session, no new QR).
+        const msg = err.message || '';
+        if (
+            msg.includes('detached Frame') ||
+            msg.includes('Target closed') ||
+            msg.includes('Protocol error') ||
+            msg.includes('Execution context')
+        ) {
+            whatsapp.markAsZombie('send-failure');
+        }
+
         res.status(500).json({
             success: false,
             error: err.message,
