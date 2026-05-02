@@ -151,6 +151,10 @@ function createClient() {
         '--disable-domain-reliability',
         '--disable-print-preview',
         '--no-pings',
+        // Force Chromium to use a temp dir for its internal profile.
+        // This prevents "profile in use" lock errors on container restart.
+        // LocalAuth session data is stored separately in SESSION_DATA_PATH.
+        '--user-data-dir=/tmp/chromium-profile',
     ];
 
     // Linux: --single-process + --no-zygote saves ~100-150MB
