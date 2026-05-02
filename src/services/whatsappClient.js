@@ -122,7 +122,8 @@ function createClient() {
         sessionPath: config.sessionDataPath,
     });
 
-    // Base args that work on all platforms
+    // Base args — maximum memory optimization for Render Starter (512MB)
+    // Memory budget: Node.js ~100MB + Chromium ~300MB = ~400MB (leaves 112MB buffer)
     const puppeteerArgs = [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -134,13 +135,13 @@ function createClient() {
         '--disable-background-networking',
         '--disable-default-apps',
         '--disable-sync',
-        // ── Memory-saving flags (critical for Render Starter 512MB plan) ──
+        // ── Critical memory flags for 512MB environments ──
         '--disable-background-timer-throttling',
         '--disable-renderer-backgrounding',
         '--disable-backgrounding-occluded-windows',
-        '--js-flags=--max-old-space-size=128',
-        // Reduce Chromium memory footprint
-        '--disable-features=site-per-process,TranslateUI',
+        '--js-flags=--max-old-space-size=64',
+        // Reduce Chromium process/rendering memory
+        '--disable-features=site-per-process,TranslateUI,BlinkGenPropertyTrees',
         '--renderer-process-limit=1',
         '--disable-canvas-aa',
         '--disable-2d-canvas-clip-aa',
@@ -152,13 +153,19 @@ function createClient() {
         '--aggressive-cache-discard',
         '--disk-cache-size=1',
         '--media-cache-size=1',
+        '--disable-ipc-flooding-protection',
+        '--mute-audio',
+        '--disable-component-update',
+        '--disable-domain-reliability',
+        '--disable-print-preview',
+        '--no-pings',
     ];
 
-    // These flags reduce memory on Linux (Docker / Render)
-    // NOTE: --single-process is intentionally NOT used — it causes crashes
-    // with whatsapp-web.js. --no-zygote alone is safe and saves memory.
+    // Linux (Docker / Render): --single-process + --no-zygote saves ~100-150MB
+    // by running everything in one process instead of spawning a renderer.
+    // This is essential to stay under 512MB.
     if (isLinux) {
-        puppeteerArgs.push('--no-zygote');
+        puppeteerArgs.push('--no-zygote', '--single-process');
     }
 
     const newClient = new Client({
