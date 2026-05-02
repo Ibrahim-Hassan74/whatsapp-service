@@ -1,6 +1,9 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const config = require('../config');
 const logger = require('../utils/logger');
+const os = require('os');
+
+const isLinux = os.platform() === 'linux';
 
 // ─── Client States ────────────────────────────────────────────────
 const State = Object.freeze({
@@ -83,22 +86,31 @@ function createClient() {
         sessionPath: config.sessionDataPath,
     });
 
+    // Base args that work on all platforms
+    const puppeteerArgs = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-extensions',
+        '--disable-software-rasterizer',
+        '--no-first-run',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-sync',
+    ];
+
+    // These flags reduce memory but only work reliably on Linux (Docker)
+    if (isLinux) {
+        puppeteerArgs.push('--no-zygote', '--single-process');
+    }
+
     const newClient = new Client({
         authStrategy: new LocalAuth({ dataPath: config.sessionDataPath }),
         puppeteer: {
             headless: true,
             executablePath: config.chromiumPath,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-extensions',
-                '--disable-software-rasterizer',
-                '--no-first-run',
-                '--no-zygote',
-                '--single-process',
-            ],
+            args: puppeteerArgs,
         },
     });
 
@@ -152,6 +164,11 @@ function createClient() {
     return newClient;
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // ─── Destroy Client ───────────────────────────────────────────────
 async function destroyClient() {
     stopHeartbeat();
@@ -166,6 +183,9 @@ async function destroyClient() {
     }
 
     client = null;
+
+    // Give Chrome time to fully release resources before re-launching
+    await sleep(2000);
 }
 
 // ─── Initialize ───────────────────────────────────────────────────

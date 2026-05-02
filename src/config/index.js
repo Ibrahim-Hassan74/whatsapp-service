@@ -2,6 +2,35 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 
+// ─── Puppeteer Cache Scanner ──────────────────────────────────────
+// Finds Chrome binary inside Puppeteer's versioned cache directory
+// e.g. /opt/render/.cache/puppeteer/chrome/linux-131.0.6778.85/chrome-linux64/chrome
+function findChromeInPuppeteerCache(cacheDir) {
+    if (!cacheDir || !fs.existsSync(cacheDir)) return null;
+
+    const chromeDir = path.join(cacheDir, 'chrome');
+    if (!fs.existsSync(chromeDir)) return null;
+
+    try {
+        const versions = fs.readdirSync(chromeDir);
+        for (const version of versions) {
+            const candidates = [
+                path.join(chromeDir, version, 'chrome-linux64', 'chrome'),
+                path.join(chromeDir, version, 'chrome-linux', 'chrome'),
+                path.join(chromeDir, version, 'chrome-win64', 'chrome.exe'),
+                path.join(chromeDir, version, 'chrome-win', 'chrome.exe'),
+            ];
+            for (const candidate of candidates) {
+                if (fs.existsSync(candidate)) return candidate;
+            }
+        }
+    } catch {
+        // Ignore read errors
+    }
+
+    return null;
+}
+
 // ─── Chromium Path Auto-Detection ─────────────────────────────────
 function detectChromiumPath() {
     // 1. Explicit env var takes priority
@@ -9,7 +38,19 @@ function detectChromiumPath() {
         return process.env.CHROMIUM_PATH;
     }
 
-    // 2. Docker / Linux — system Chromium
+    // 2. Puppeteer cache (Render, Railway, or any platform using render-build.sh)
+    const puppeteerCacheDirs = [
+        process.env.PUPPETEER_CACHE_DIR,
+        '/opt/render/.cache/puppeteer',
+        path.join(process.env.HOME || '', '.cache', 'puppeteer'),
+    ];
+
+    for (const cacheDir of puppeteerCacheDirs) {
+        const found = findChromeInPuppeteerCache(cacheDir);
+        if (found) return found;
+    }
+
+    // 3. Docker / Linux — system Chromium
     const linuxPaths = [
         '/usr/bin/chromium',
         '/usr/bin/chromium-browser',
@@ -17,14 +58,14 @@ function detectChromiumPath() {
         '/usr/bin/google-chrome-stable',
     ];
 
-    // 3. Windows — common Chrome locations
+    // 4. Windows — common Chrome locations
     const windowsPaths = [
         path.join(process.env.PROGRAMFILES || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
         path.join(process.env['PROGRAMFILES(X86)'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
         path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
     ];
 
-    // 4. macOS
+    // 5. macOS
     const macPaths = [
         '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
         '/Applications/Chromium.app/Contents/MacOS/Chromium',
