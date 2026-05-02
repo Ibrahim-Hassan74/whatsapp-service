@@ -3,7 +3,7 @@ services:
     name: whatsapp-service
     runtime: node
     buildCommand: bash render-build.sh
-    startCommand: node index.js
+    startCommand: node --max-old-space-size=384 index.js
     plan: starter
     healthCheckPath: /health
     envVars:

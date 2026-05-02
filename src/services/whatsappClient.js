@@ -134,16 +134,31 @@ function createClient() {
         '--disable-background-networking',
         '--disable-default-apps',
         '--disable-sync',
-        // Memory-saving flags for constrained environments (Render, Docker)
+        // ── Memory-saving flags (critical for Render Starter 512MB plan) ──
         '--disable-background-timer-throttling',
         '--disable-renderer-backgrounding',
         '--disable-backgrounding-occluded-windows',
-        '--js-flags=--max-old-space-size=256',
+        '--js-flags=--max-old-space-size=128',
+        // Reduce Chromium memory footprint
+        '--disable-features=site-per-process,TranslateUI',
+        '--renderer-process-limit=1',
+        '--disable-canvas-aa',
+        '--disable-2d-canvas-clip-aa',
+        '--disable-gl-drawing-for-tests',
+        '--disable-font-subpixel-positioning',
+        '--disable-remote-fonts',
+        '--disable-logging',
+        '--disable-permissions-api',
+        '--aggressive-cache-discard',
+        '--disk-cache-size=1',
+        '--media-cache-size=1',
     ];
 
-    // These flags reduce memory but only work reliably on Linux (Docker)
+    // These flags reduce memory on Linux (Docker / Render)
+    // NOTE: --single-process is intentionally NOT used — it causes crashes
+    // with whatsapp-web.js. --no-zygote alone is safe and saves memory.
     if (isLinux) {
-        puppeteerArgs.push('--no-zygote', '--single-process');
+        puppeteerArgs.push('--no-zygote');
     }
 
     const newClient = new Client({
@@ -169,9 +184,15 @@ function createClient() {
         retryCount = 0;
         lastReadyTimestamp = Date.now();
         consecutiveHeartbeatFails = 0;
+        const mem = process.memoryUsage();
         logger.info('WhatsApp client is READY and connected', {
             pid: process.pid,
             uptime: Math.floor(process.uptime()),
+            memoryMB: {
+                rss: Math.round(mem.rss / 1024 / 1024),
+                heapUsed: Math.round(mem.heapUsed / 1024 / 1024),
+                heapTotal: Math.round(mem.heapTotal / 1024 / 1024),
+            },
         });
         postToAspNet('/update-status', { isConnected: true });
 
