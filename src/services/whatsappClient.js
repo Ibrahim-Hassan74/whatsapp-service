@@ -1,3 +1,20 @@
+/**
+ * WhatsApp Client Service
+ *
+ * Designed for stability on Render Free/Starter plans (512MB RAM, limited CPU).
+ *
+ * Key design decisions for low-resource environments:
+ * 1. NO active heartbeat polling — client.getState() talks to Chromium which
+ *    can be unresponsive under low resources, causing false disconnects.
+ *    Instead, we rely on whatsapp-web.js's built-in events (disconnected,
+ *    change_state, auth_failure) to detect real problems.
+ * 2. Session reuse by default — never destroy sessions unless explicitly
+ *    logged out or auth_failure occurs.
+ * 3. Conservative restart policy — long cooldowns, max retry cap, and
+ *    a shutdown flag to prevent restarts during SIGTERM.
+ * 4. Single-process Chromium — essential to stay under 512MB.
+ */
+
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const config = require('../config');
 const logger = require('../utils/logger');
@@ -12,6 +29,7 @@ const State = Object.freeze({
     QR_PENDING: 'QR_PENDING',
     CONNECTED: 'CONNECTED',
     RECONNECTING: 'RECONNECTING',
+    SHUTTING_DOWN: 'SHUTTING_DOWN',
 });
 
 // ─── Module State ─────────────────────────────────────────────────
@@ -19,15 +37,33 @@ let client = null;
 let state = State.DISCONNECTED;
 let retryCount = 0;
 let restartTimer = null;
-let heartbeatTimer = null;
-let initLock = false;              // Hard lock against concurrent init
-let consecutiveHeartbeatFails = 0; // Track consecutive heartbeat failures
-let lastReadyTimestamp = 0;        // Debounce restarts after connect
+let initLock = false;          // Hard lock against concurrent init
+let lastReadyTimestamp = 0;    // Debounce restarts after connect
+let isShuttingDown = false;    // Prevents any restart during shutdown
 
-const HEARTBEAT_FAIL_THRESHOLD = 3;      // Failures before restart
-const READY_GRACE_PERIOD_MS = 30000;      // 30s grace after becoming READY
-const INIT_TIMEOUT_MS = 5 * 60 * 1000;   // 5 minutes max for initialize()
-const HEARTBEAT_STABILIZE_DELAY_MS = 15000; // Wait 15s after READY before heartbeat
+// ─── Constants ────────────────────────────────────────────────────
+const MAX_RETRIES = config.maxRetries || 5;
+const READY_GRACE_PERIOD_MS = 60000;      // 60s grace — no restarts after READY
+const INIT_TIMEOUT_MS = 5 * 60 * 1000;    // 5 minutes max for initialize()
+const MIN_RESTART_DELAY_MS = 15000;        // Minimum 15s between restarts
+const MAX_RESTART_DELAY_MS = 120000;       // Max 2 minutes between restarts
+
+// Transient Puppeteer errors that should NOT trigger a restart
+const TRANSIENT_ERRORS = [
+    'Target closed',
+    'Session closed',
+    'Protocol error',
+    'Navigation failed',
+    'Execution context was destroyed',
+    'Cannot find context',
+    'frame was detached',
+    'Page crashed',
+];
+
+function isTransientError(errorMessage) {
+    if (!errorMessage) return false;
+    return TRANSIENT_ERRORS.some((t) => errorMessage.includes(t));
+}
 
 // ─── ASP.NET Backend Communication ────────────────────────────────
 async function postToAspNet(endpoint, data) {
@@ -41,6 +77,7 @@ async function postToAspNet(endpoint, data) {
                 'x-server-name': config.serverName,
             },
             body: JSON.stringify(data),
+            signal: AbortSignal.timeout(10000), // 10s timeout for backend calls
         });
 
         if (!response.ok) {
@@ -50,69 +87,22 @@ async function postToAspNet(endpoint, data) {
             });
         }
     } catch (err) {
-        logger.error('Failed to reach ASP.NET backend', {
+        // Backend communication failures are non-fatal — just log
+        logger.warn('Failed to reach ASP.NET backend', {
             endpoint,
             error: err.message,
         });
     }
 }
 
-// ─── Heartbeat ────────────────────────────────────────────────────
-function startHeartbeat() {
-    stopHeartbeat();
-    consecutiveHeartbeatFails = 0;
-
-    heartbeatTimer = setInterval(async () => {
-        if (state !== State.CONNECTED || !client) return;
-
-        try {
-            const wState = await client.getState();
-            if (wState === 'CONNECTED') {
-                // Healthy — reset failure counter
-                consecutiveHeartbeatFails = 0;
-                return;
-            }
-
-            // Not CONNECTED but not necessarily fatal (e.g. OPENING, PAIRING)
-            consecutiveHeartbeatFails++;
-            logger.warn('Heartbeat: unexpected WhatsApp state', {
-                wState,
-                consecutiveFails: consecutiveHeartbeatFails,
-                threshold: HEARTBEAT_FAIL_THRESHOLD,
-            });
-
-            if (consecutiveHeartbeatFails >= HEARTBEAT_FAIL_THRESHOLD) {
-                logger.error('Heartbeat: too many consecutive failures — triggering reconnect');
-                state = State.DISCONNECTED;
-                consecutiveHeartbeatFails = 0;
-                postToAspNet('/update-status', { isConnected: false });
-                scheduleRestart('heartbeat-disconnect');
-            }
-        } catch (err) {
-            consecutiveHeartbeatFails++;
-            logger.warn('Heartbeat check failed', {
-                error: err.message,
-                consecutiveFails: consecutiveHeartbeatFails,
-                threshold: HEARTBEAT_FAIL_THRESHOLD,
-            });
-
-            if (consecutiveHeartbeatFails >= HEARTBEAT_FAIL_THRESHOLD) {
-                logger.error('Heartbeat: too many consecutive errors — triggering reconnect');
-                state = State.DISCONNECTED;
-                consecutiveHeartbeatFails = 0;
-                postToAspNet('/update-status', { isConnected: false });
-                scheduleRestart('heartbeat-error');
-            }
-        }
-    }, config.heartbeatIntervalMs);
-}
-
-function stopHeartbeat() {
-    if (heartbeatTimer) {
-        clearInterval(heartbeatTimer);
-        heartbeatTimer = null;
-    }
-    consecutiveHeartbeatFails = 0;
+// ─── Memory Logging ───────────────────────────────────────────────
+function logMemory(context) {
+    const mem = process.memoryUsage();
+    logger.info(`Memory usage [${context}]`, {
+        rss: `${Math.round(mem.rss / 1024 / 1024)}MB`,
+        heapUsed: `${Math.round(mem.heapUsed / 1024 / 1024)}MB`,
+        heapTotal: `${Math.round(mem.heapTotal / 1024 / 1024)}MB`,
+    });
 }
 
 // ─── Client Factory ───────────────────────────────────────────────
@@ -122,8 +112,8 @@ function createClient() {
         sessionPath: config.sessionDataPath,
     });
 
-    // Base args — maximum memory optimization for Render Starter (512MB)
-    // Memory budget: Node.js ~100MB + Chromium ~300MB = ~400MB (leaves 112MB buffer)
+    // Maximum memory optimization for Render Free/Starter (512MB total)
+    // Memory budget: Node.js ~80MB + Chromium ~250MB = ~330MB (leaves ~180MB buffer)
     const puppeteerArgs = [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -135,12 +125,11 @@ function createClient() {
         '--disable-background-networking',
         '--disable-default-apps',
         '--disable-sync',
-        // ── Critical memory flags for 512MB environments ──
+        // ── Critical memory flags ──
         '--disable-background-timer-throttling',
         '--disable-renderer-backgrounding',
         '--disable-backgrounding-occluded-windows',
         '--js-flags=--max-old-space-size=64',
-        // Reduce Chromium process/rendering memory
         '--disable-features=site-per-process,TranslateUI,BlinkGenPropertyTrees',
         '--renderer-process-limit=1',
         '--disable-canvas-aa',
@@ -161,9 +150,7 @@ function createClient() {
         '--no-pings',
     ];
 
-    // Linux (Docker / Render): --single-process + --no-zygote saves ~100-150MB
-    // by running everything in one process instead of spawning a renderer.
-    // This is essential to stay under 512MB.
+    // Linux: --single-process + --no-zygote saves ~100-150MB
     if (isLinux) {
         puppeteerArgs.push('--no-zygote', '--single-process');
     }
@@ -179,6 +166,7 @@ function createClient() {
 
     // ── QR Code ──
     newClient.on('qr', (qr) => {
+        if (isShuttingDown) return;
         state = State.QR_PENDING;
         retryCount = 0;
         logger.info('QR code generated — waiting for scan');
@@ -187,62 +175,60 @@ function createClient() {
 
     // ── Ready ──
     newClient.on('ready', () => {
+        if (isShuttingDown) return;
         state = State.CONNECTED;
         retryCount = 0;
         lastReadyTimestamp = Date.now();
-        consecutiveHeartbeatFails = 0;
-        const mem = process.memoryUsage();
+        logMemory('READY');
         logger.info('WhatsApp client is READY and connected', {
             pid: process.pid,
             uptime: Math.floor(process.uptime()),
-            memoryMB: {
-                rss: Math.round(mem.rss / 1024 / 1024),
-                heapUsed: Math.round(mem.heapUsed / 1024 / 1024),
-                heapTotal: Math.round(mem.heapTotal / 1024 / 1024),
-            },
         });
         postToAspNet('/update-status', { isConnected: true });
-
-        // Delay heartbeat start to let the connection stabilize
-        // This prevents false positives immediately after connect
-        logger.info(`Heartbeat will start in ${HEARTBEAT_STABILIZE_DELAY_MS / 1000}s`);
-        setTimeout(() => {
-            if (state === State.CONNECTED) {
-                startHeartbeat();
-                logger.info('Heartbeat started');
-            }
-        }, HEARTBEAT_STABILIZE_DELAY_MS);
+        // NO heartbeat — we rely entirely on event-driven detection.
+        // This avoids the #1 cause of false restarts on low-resource plans.
     });
 
     // ── Authenticated ──
     newClient.on('authenticated', () => {
-        logger.info('WhatsApp client authenticated successfully (session loaded from disk)');
+        logger.info('WhatsApp client authenticated (session restored from disk)');
     });
 
     // ── Auth Failure ──
+    // This is the ONLY case where we force a new session
     newClient.on('auth_failure', (msg) => {
+        if (isShuttingDown) return;
         state = State.DISCONNECTED;
-        stopHeartbeat();
-        logger.error('Authentication failure — will retry with fresh session', { message: msg });
+        logger.error('Authentication failure — session invalid, will create fresh session', {
+            message: msg,
+        });
         postToAspNet('/update-status', { isConnected: false });
-
-        // Auth failures need a fresh session
         scheduleRestart('auth-failure', { forceNew: true });
     });
 
     // ── Disconnected ──
+    // Real disconnect event from WhatsApp — try to reconnect with existing session
     newClient.on('disconnected', (reason) => {
+        if (isShuttingDown) return;
         state = State.DISCONNECTED;
-        stopHeartbeat();
         logger.warn('WhatsApp client disconnected', { reason });
         postToAspNet('/update-status', { isConnected: false });
-        // Try to reconnect reusing the existing session first
+
+        // NAVIGATION is a known benign reason from whatsapp-web.js — skip restart
+        if (reason === 'NAVIGATION') {
+            logger.info('Disconnected due to NAVIGATION — not restarting (transient)');
+            return;
+        }
+
         scheduleRestart('disconnect');
     });
 
     // ── Change State ──
+    // Informational only — do NOT trigger restarts from state changes
     newClient.on('change_state', (newState) => {
         logger.info('WhatsApp state changed', { newState });
+        // Do NOT restart on state changes. States like OPENING, PAIRING,
+        // TIMEOUT are transient and resolve on their own.
     });
 
     return newClient;
@@ -255,12 +241,13 @@ function sleep(ms) {
 
 // ─── Destroy Client ───────────────────────────────────────────────
 async function destroyClient() {
-    stopHeartbeat();
-
     if (!client) return;
 
     try {
-        await client.destroy();
+        await Promise.race([
+            client.destroy(),
+            sleep(5000), // Don't hang more than 5s trying to destroy
+        ]);
         logger.info('Previous client destroyed');
     } catch (err) {
         logger.warn('Error destroying client (ignored)', { error: err.message });
@@ -268,15 +255,21 @@ async function destroyClient() {
 
     client = null;
 
-    // Give Chrome time to fully release resources before re-launching
-    await sleep(2000);
+    // Give Chrome time to fully release resources
+    await sleep(3000);
 }
 
 // ─── Initialize ───────────────────────────────────────────────────
 async function initializeClient({ forceNew = false } = {}) {
-    // Hard lock — absolutely prevent concurrent initialization
+    // Block all init during shutdown
+    if (isShuttingDown) {
+        logger.warn('initializeClient() blocked — service is shutting down');
+        return;
+    }
+
+    // Hard lock — prevent concurrent initialization
     if (initLock) {
-        logger.warn('initializeClient() called but init lock is held — skipping', {
+        logger.warn('initializeClient() blocked — init lock held', {
             currentState: state,
         });
         return;
@@ -298,10 +291,10 @@ async function initializeClient({ forceNew = false } = {}) {
             client = createClient();
         }
 
+        logMemory('pre-init');
         logger.info('Initializing WhatsApp client...', {
             attempt: retryCount + 1,
             forceNew,
-            hasExistingClient: !!client,
         });
 
         // Wrap initialize() in a timeout to prevent hanging forever
@@ -309,23 +302,35 @@ async function initializeClient({ forceNew = false } = {}) {
             client.initialize(),
             new Promise((_, reject) =>
                 setTimeout(
-                    () => reject(new Error(`Client initialization timed out after ${INIT_TIMEOUT_MS / 1000}s`)),
+                    () => reject(new Error(`Client init timed out after ${INIT_TIMEOUT_MS / 1000}s`)),
                     INIT_TIMEOUT_MS
                 )
             ),
         ]);
+
+        // If we get here without the ready event, state may still be
+        // INITIALIZING. That's fine — the ready event will set CONNECTED.
     } catch (err) {
         state = State.DISCONNECTED;
+
+        // Don't restart on transient Puppeteer errors if we just connected
+        if (isTransientError(err.message)) {
+            logger.warn('Client init hit transient error (not restarting)', {
+                error: err.message,
+            });
+            return;
+        }
+
         logger.error('Client initialization failed', {
             error: err.message,
             attempt: retryCount + 1,
-            maxRetries: config.maxRetries,
+            maxRetries: MAX_RETRIES,
         });
 
-        if (retryCount < config.maxRetries) {
+        if (retryCount < MAX_RETRIES) {
             scheduleRestart('init-failure');
         } else {
-            logger.error('Max retries reached — giving up. Manual restart required.');
+            logger.error('Max retries reached — service will stay idle. Use /restart to try again.');
             postToAspNet('/update-status', { isConnected: false });
         }
     } finally {
@@ -335,17 +340,25 @@ async function initializeClient({ forceNew = false } = {}) {
 
 // ─── Schedule Restart (Exponential Backoff) ───────────────────────
 function scheduleRestart(reason, { forceNew = false } = {}) {
-    if (restartTimer || state === State.INITIALIZING || state === State.RECONNECTING) {
-        logger.info('scheduleRestart() skipped — already pending or initializing', {
+    // Never restart during shutdown
+    if (isShuttingDown) {
+        logger.info('scheduleRestart() blocked — shutting down', { reason });
+        return;
+    }
+
+    if (restartTimer) {
+        logger.info('scheduleRestart() skipped — restart already pending', {
             reason,
-            hasTimer: !!restartTimer,
-            state,
         });
         return;
     }
 
-    // Debounce: if we just became READY, don't restart for a grace period.
-    // This prevents false restarts from transient post-connect instability.
+    if (state === State.INITIALIZING || state === State.RECONNECTING) {
+        logger.info('scheduleRestart() skipped — init in progress', { reason });
+        return;
+    }
+
+    // Grace period: if we just became READY, don't restart for 60s
     const timeSinceReady = Date.now() - lastReadyTimestamp;
     if (lastReadyTimestamp > 0 && timeSinceReady < READY_GRACE_PERIOD_MS) {
         logger.info('scheduleRestart() skipped — within grace period after READY', {
@@ -356,9 +369,19 @@ function scheduleRestart(reason, { forceNew = false } = {}) {
         return;
     }
 
+    // Check retry cap
+    if (retryCount >= MAX_RETRIES) {
+        logger.error('scheduleRestart() blocked — max retries reached', {
+            reason,
+            retryCount,
+            maxRetries: MAX_RETRIES,
+        });
+        return;
+    }
+
     retryCount++;
-    // Exponential backoff: 5s, 10s, 20s, 40s, 60s (capped)
-    const delay = Math.min(5000 * Math.pow(2, retryCount - 1), 60000);
+    // Exponential backoff: 15s, 30s, 60s, 120s (capped)
+    const delay = Math.min(MIN_RESTART_DELAY_MS * Math.pow(2, retryCount - 1), MAX_RESTART_DELAY_MS);
 
     logger.info('Scheduling restart', {
         reason,
@@ -369,23 +392,37 @@ function scheduleRestart(reason, { forceNew = false } = {}) {
 
     restartTimer = setTimeout(() => {
         restartTimer = null;
-        initializeClient({ forceNew });
+        if (!isShuttingDown) {
+            initializeClient({ forceNew });
+        }
     }, delay);
 }
 
 // ─── Graceful Shutdown ────────────────────────────────────────────
 async function shutdown() {
-    logger.info('Shutting down WhatsApp client...');
-    stopHeartbeat();
-    clearTimeout(restartTimer);
+    // Set flags FIRST to block all restarts / re-init
+    isShuttingDown = true;
+    state = State.SHUTTING_DOWN;
 
+    logger.info('Shutting down WhatsApp client...');
+
+    // Cancel any pending restart
+    if (restartTimer) {
+        clearTimeout(restartTimer);
+        restartTimer = null;
+    }
+
+    // Destroy client with timeout
     try {
         if (client) {
-            await client.destroy();
+            await Promise.race([
+                client.destroy(),
+                sleep(5000),
+            ]);
             logger.info('Client destroyed on shutdown');
         }
     } catch (err) {
-        logger.warn('Error during shutdown', { error: err.message });
+        logger.warn('Error during shutdown (ignored)', { error: err.message });
     }
 
     state = State.DISCONNECTED;

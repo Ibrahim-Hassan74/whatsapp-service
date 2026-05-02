@@ -4,15 +4,13 @@ services:
     runtime: node
     buildCommand: bash render-build.sh
     startCommand: node --max-old-space-size=256 index.js
-    plan: starter
+    plan: free
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
       - key: NODE_OPTIONS
-        value: "--max-old-space-size=384"
-      - key: PUPPETEER_CACHE_DIR
-        value: /opt/render/.cache/puppeteer
+        value: "--max-old-space-size=256"
       - key: SESSION_DATA_PATH
         value: /opt/render/project/src/sessions
       - key: PORT

@@ -135,8 +135,8 @@ const config = Object.freeze({
     chromiumPath,
 
     // Reconnection
-    maxRetries: parseInt(process.env.MAX_RETRIES, 10) || 5,
-    heartbeatIntervalMs: parseInt(process.env.HEARTBEAT_INTERVAL_MS, 10) || 30000,
+    maxRetries: parseInt(process.env.MAX_RETRIES, 10) || 3,
+    heartbeatIntervalMs: parseInt(process.env.HEARTBEAT_INTERVAL_MS, 10) || 60000,
 
     // Derived
     isProduction: (process.env.NODE_ENV || 'development') === 'production',
