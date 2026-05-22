@@ -212,11 +212,12 @@ function createClient() {
         '--user-data-dir=/tmp/chromium-profile',
     ];
 
-    // Linux: --no-zygote saves memory.
-    // NOTE: --single-process is NOT used — with 2 vCPUs we can afford
-    // a separate renderer process, which is MUCH more stable.
+    // Linux: --single-process + --no-zygote saves ~100-150MB.
+    // With only 1GB RAM, multi-process Chromium causes OOM.
+    // With 2 vCPUs, single-process mode is stable (previous instability
+    // was caused by CPU starvation at 0.25 vCPU, not the flag itself).
     if (isLinux) {
-        puppeteerArgs.push('--no-zygote');
+        puppeteerArgs.push('--no-zygote', '--single-process');
     }
 
     const newClient = new Client({
