@@ -59,5 +59,5 @@ EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD node -e "fetch('http://localhost:5000/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
 
-# Start the service (no memory restriction — Azure B2ats v2 has 1GB RAM)
-CMD ["node", "--max-old-space-size=384", "index.js"]
+# Start the service (Azure B2als v2 has 4GB RAM — generous heap)
+CMD ["node", "--max-old-space-size=512", "index.js"]

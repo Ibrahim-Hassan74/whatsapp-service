@@ -1,12 +1,11 @@
 /**
  * WhatsApp Client Service
  *
- * Optimized for Azure B2ats v2 (2 vCPU, 1GB RAM).
+ * Optimized for Azure B2als v2 (2 vCPU, 4GB RAM).
  *
  * Key design decisions:
- * 1. Multi-process Chromium — 2 vCPUs can handle a separate renderer.
- *    This eliminates "detached Frame" and "auth timeout" errors that
- *    plagued single-process mode on low-CPU hosts.
+ * 1. Multi-process Chromium — 4GB RAM + 2 vCPUs can handle separate
+ *    renderer processes. NO --single-process flag needed.
  * 2. Gentle heartbeat — with proper CPU, getState() is reliable.
  *    5 consecutive failures required before triggering reconnect.
  * 3. Session reuse by default — never destroy sessions unless explicitly
@@ -196,7 +195,7 @@ function createClient() {
         '--disable-background-timer-throttling',
         '--disable-renderer-backgrounding',
         '--disable-backgrounding-occluded-windows',
-        '--js-flags=--max-old-space-size=128',
+        '--js-flags=--max-old-space-size=256',
         '--disable-features=TranslateUI',
         '--disable-canvas-aa',
         '--disable-remote-fonts',
@@ -212,12 +211,11 @@ function createClient() {
         '--user-data-dir=/tmp/chromium-profile',
     ];
 
-    // Linux: --single-process + --no-zygote saves ~100-150MB.
-    // With only 1GB RAM, multi-process Chromium causes OOM.
-    // With 2 vCPUs, single-process mode is stable (previous instability
-    // was caused by CPU starvation at 0.25 vCPU, not the flag itself).
+    // Linux: --no-zygote saves memory on the zygote process.
+    // With 4GB RAM, we do NOT need --single-process.
+    // Multi-process Chromium is more stable and avoids "detached Frame" errors.
     if (isLinux) {
-        puppeteerArgs.push('--no-zygote', '--single-process');
+        puppeteerArgs.push('--no-zygote');
     }
 
     const newClient = new Client({
